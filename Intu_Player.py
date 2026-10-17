@@ -9,11 +9,13 @@ logger = logging.getLogger(__name__)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QLabel, QSlider, QListWidget, QStyle,
-    QSizePolicy, QDialog, QAbstractItemView, QComboBox, QListWidgetItem,QMessageBox,QMenu
+    QSizePolicy, QDialog, QAbstractItemView, QComboBox, QListWidgetItem,QMessageBox,QMenu,
+    QStackedWidget
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QMediaDevices
-from PyQt6.QtCore import Qt, QUrl, QDir, QTime, QByteArray
-from PyQt6.QtGui import QPixmap, QResizeEvent, QCloseEvent,QAction
+from PyQt6.QtMultimediaWidgets import QVideoWidget
+from PyQt6.QtCore import Qt, QUrl, QDir, QTime, QByteArray, QTimer, pyqtSignal
+from PyQt6.QtGui import QPixmap, QResizeEvent, QCloseEvent,QAction, QFontMetrics
 import urllib.request
 from pypinyin import lazy_pinyin
 
@@ -66,7 +68,7 @@ QListWidget {background-color: #3c3c3c; color: #f0f0f0; border: 1px solid #50505
 QListWidget::item:hover {background-color: #555555;}
 
 """
-CURRENT_VERSION = "v2.7.1"
+CURRENT_VERSION = "v2.8.0"
 
 # ---------------------------------------------------------------------------
 # Key → semitone map (relative to C)
@@ -258,6 +260,46 @@ class ImageDisplayLabel(QLabel):
             self._scale_pixmap()
         super().resizeEvent(event)
 
+# =================== 顶部文件名/大小信息条 ===================
+class ElidedLabel(QLabel):
+    """居中显示文本，过长时中间省略（随宽度自适应）"""
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumWidth(1)
+        self.setFullText(text)
+
+    def setFullText(self, text):
+        self._full_text = text or ""
+        self._update_elide()
+
+    def fullText(self):
+        return self._full_text
+
+    def _update_elide(self):
+        metrics = QFontMetrics(self.font())
+        elided = metrics.elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, max(0, self.width())
+        )
+        super().setText(elided)
+
+    def resizeEvent(self, event: QResizeEvent):
+        super().resizeEvent(event)
+        self._update_elide()
+
+# =================== 可点击的视频显示部件 ===================
+class ClickableVideoWidget(QVideoWidget):
+    """整块视频画面点击时发出 clicked 信号（用于播放/暂停）"""
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
 # =================== 播放列表 ===================
 class PlaylistDialog(QDialog):
     def __init__(self, parent=None):
@@ -275,11 +317,8 @@ class PlaylistDialog(QDialog):
         button_layout = QHBoxLayout()
         self.refresh_button = QPushButton("刷新")
         self.refresh_button.clicked.connect(self.refresh_list)
-        close_button = QPushButton("关闭")
-        close_button.clicked.connect(self.close)
-        
+
         button_layout.addWidget(self.refresh_button)
-        button_layout.addWidget(close_button)
         layout.addLayout(button_layout)
 
     def item_double_clicked(self, item):
@@ -296,6 +335,8 @@ class PlaylistDialog(QDialog):
 # =================== 主播放器 ===================
 class AudioPlayer(QMainWindow):
     AUDIO_EXTENSIONS = ('.mp3', '.wav', '.flac', '.ogg', '.m4a')
+    VIDEO_EXTENSIONS = ('.mp4', '.m4v', '.mov', '.wmv', '.avi', '.mkv', '.flv',
+                        '.webm', '.mpg', '.mpeg', '.ts', '.3gp')
     IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.bmp', '.gif')
 
     def __init__(self):
@@ -321,6 +362,9 @@ class AudioPlayer(QMainWindow):
         self.playlist_memory = []
         self.current_file_path = None
         self.window_geometry = None 
+        self._previewing = False
+        self._preview_saved_volume = 0.7
+        self._invalid_warned = False
         
         self.load_settings()
 
@@ -349,8 +393,25 @@ class AudioPlayer(QMainWindow):
         full_layout.setSpacing(10)
         self.setCentralWidget(main_container)
 
+        # ---------- 顶部文件名 / 大小 信息条 ----------
+        self.info_label = ElidedLabel("")
+        self.info_label.setFixedHeight(28)
+        self.info_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.info_label.setStyleSheet(
+            "background-color: #3c3c3c; border: 1px solid #505050;"
+            "border-radius: 4px; padding: 0 8px;"
+        )
+        full_layout.addWidget(self.info_label)
+
+        # ---------- 中央区域：图片 / 视频 叠放 ----------
         self.image_label = ImageDisplayLabel("无图片")
-        full_layout.addWidget(self.image_label, 20)
+        self.video_widget = ClickableVideoWidget()
+        self.video_widget.clicked.connect(self.play_pause)
+        self.center_stack = QStackedWidget()
+        self.center_stack.addWidget(self.image_label)   # 索引 0
+        self.center_stack.addWidget(self.video_widget)  # 索引 1
+        full_layout.addWidget(self.center_stack, 20)
+        self.player.setVideoOutput(self.video_widget)
 
         control_container = QVBoxLayout()
         progress_layout = QHBoxLayout()
@@ -448,13 +509,13 @@ class AudioPlayer(QMainWindow):
                 self.playlist_dialog.playlist_widget.addItem(item)
             if self.current_file_path in self.playlist:
                 self.current_index = self.playlist.index(self.current_file_path)
-                # 修改这里：只加载文件但不播放
-                self.player.setSource(QUrl.fromLocalFile(self.current_file_path))
-                self.load_image(self.current_file_path)
+                # 修改这里：只加载文件但不播放（视频不做首帧预览）
+                self._load_media(self.current_file_path, preview_first_frame=False)
                 self.playlist_dialog.playlist_widget.setCurrentRow(self.current_index)
 
-        # 确保启动时始终加载图片并发送变调（不受上述条件限制）
-        if self.current_file_path and os.path.isfile(self.current_file_path) and not self.image_timeline:
+        # 确保启动时始终加载图片并发送变调（视频文件走视频部件，不加载图片）
+        if (self.current_file_path and os.path.isfile(self.current_file_path)
+                and not self.image_timeline and not self._is_video(self.current_file_path)):
             self.load_image(self.current_file_path)
 
     def mousePressEvent(self, event):
@@ -507,8 +568,15 @@ class AudioPlayer(QMainWindow):
         self.device_combo.showPopup() 
 
     def open_file(self):
-        filter_str = f"音频文件 ({' '.join(['*' + ext for ext in self.AUDIO_EXTENSIONS])})"
-        file_path, _ = QFileDialog.getOpenFileName(self, "选择音频文件", self.last_dir, filter_str)
+        audio_pat = ' '.join('*' + ext for ext in self.AUDIO_EXTENSIONS)
+        video_pat = ' '.join('*' + ext for ext in self.VIDEO_EXTENSIONS)
+        filter_str = (
+            f"媒体文件 ({audio_pat} {video_pat});;"
+            f"音频文件 ({audio_pat});;"
+            f"视频文件 ({video_pat});;"
+            "所有文件 (*)"
+        )
+        file_path, _ = QFileDialog.getOpenFileName(self, "选择媒体文件", self.last_dir, filter_str)
         if not file_path: return
         self.last_dir = os.path.dirname(file_path)
         normalized = os.path.abspath(file_path).replace(os.sep, '/')
@@ -537,14 +605,14 @@ class AudioPlayer(QMainWindow):
             if self.current_file_path in self.playlist:
                 self.current_index = self.playlist.index(self.current_file_path)
                 self.playlist_dialog.playlist_widget.setCurrentRow(self.current_index)
-                self.player.setSource(QUrl.fromLocalFile(self.current_file_path))
+                self._load_media(self.current_file_path, preview_first_frame=False)
                 self.player.setPosition(current_pos)
                 
                 if was_playing:
                     self.player.play()
                 
-                self.load_image(self.current_file_path)
-                self.switch_image_by_time(current_pos)
+                if not self._is_video(self.current_file_path):
+                    self.switch_image_by_time(current_pos)
             else:
                 self.stop()
                 self.current_index = -1
@@ -556,7 +624,7 @@ class AudioPlayer(QMainWindow):
         self.playlist.clear()
         self.playlist_dialog.playlist_widget.clear()
         dir_obj = QDir(directory)
-        name_filters = [f"*{ext}" for ext in self.AUDIO_EXTENSIONS]
+        name_filters = [f"*{ext}" for ext in self.AUDIO_EXTENSIONS] + [f"*{ext}" for ext in self.VIDEO_EXTENSIONS]
         files = [f.absoluteFilePath().replace(os.sep, '/') for f in dir_obj.entryInfoList(name_filters, QDir.Filter.Files | QDir.Filter.NoDotAndDotDot)]
         files.sort(key=lambda path: ''.join(lazy_pinyin(os.path.basename(path))))
         self.playlist = files
@@ -567,12 +635,77 @@ class AudioPlayer(QMainWindow):
             item.setData(Qt.ItemDataRole.UserRole, f)
             self.playlist_dialog.playlist_widget.addItem(item)
             
-    def play_file(self, file_path):
+    def _is_video(self, file_path):
+        return os.path.splitext(file_path)[1].lower() in self.VIDEO_EXTENSIONS
+
+    @staticmethod
+    def _format_size(num_bytes):
+        return f"{num_bytes / (1024 * 1024):.1f}M"
+
+    def update_info_label(self, file_path):
+        """顶部信息条：文件名 + 文件大小（如 女人花.mp3   6.5M）"""
+        if not file_path:
+            self.info_label.setFullText("")
+            return
+        try:
+            name = os.path.basename(file_path)
+            size = self._format_size(os.path.getsize(file_path))
+            self.info_label.setFullText(f"{name}   {size}")
+        except OSError:
+            self.info_label.setFullText(os.path.basename(file_path))
+
+    def _load_media(self, file_path, preview_first_frame):
+        """按媒体类型加载：视频→视频部件；音频→图片逻辑。不自动播放。"""
         self.current_file_path = file_path
+        self._invalid_warned = False
+        self.update_info_label(file_path)
+        if self._is_video(file_path):
+            self.image_timeline = []
+            self.current_image_index = -1
+            self.image_label.setOriginalPixmap(QPixmap())
+            self.center_stack.setCurrentWidget(self.video_widget)
+            self.player.setSource(QUrl.fromLocalFile(file_path))
+            if preview_first_frame:
+                self._preview_first_frame()
+        else:
+            self.center_stack.setCurrentWidget(self.image_label)
+            self.player.setSource(QUrl.fromLocalFile(file_path))
+            self.load_image(file_path)
+
+    def _preview_first_frame(self):
+        """选中视频后：静音短暂播放到第一帧，然后暂停，实现首帧预览。"""
+        self._previewing = True
+        self._preview_saved_volume = self.audio_output.volume()
+        self.audio_output.setVolume(0.0)
+        try:
+            self.video_widget.videoSink().videoFrameChanged.connect(self._on_preview_frame)
+        except Exception as e:
+            logger.warning('videoSink unavailable, fallback timer: %s', e)
+            QTimer.singleShot(300, self._finish_preview)
+        self.player.setPosition(0)
+        self.player.play()
+
+    def _on_preview_frame(self, *_args):
+        if getattr(self, '_previewing', False):
+            self._finish_preview()
+
+    def _finish_preview(self):
+        if not getattr(self, '_previewing', False):
+            return
+        self._previewing = False
+        self.player.pause()
+        try:
+            self.video_widget.videoSink().videoFrameChanged.disconnect(self._on_preview_frame)
+        except Exception:
+            pass
+        self.audio_output.setVolume(self._preview_saved_volume)
+        self.player.setPosition(0)
+        self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+
+    def play_file(self, file_path):
         self.player.stop()
-        self.player.setSource(QUrl.fromLocalFile(file_path))
-        self.load_image(file_path)
-        # 移除了自动播放的代码，现在只有用户点击播放按钮才会播放
+        self._load_media(file_path, preview_first_frame=True)
+        # 视频仅做首帧预览；音频需用户点击播放按钮才会播放
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.save_settings()
 
@@ -595,7 +728,7 @@ class AudioPlayer(QMainWindow):
             self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         else:
             if self.player.source().isEmpty() and self.current_file_path:
-                self.player.setSource(QUrl.fromLocalFile(self.current_file_path))
+                self._load_media(self.current_file_path, preview_first_frame=False)
             self.player.play()
             self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
@@ -623,11 +756,22 @@ class AudioPlayer(QMainWindow):
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
     def show_playlist(self):
-        self.playlist_dialog.show()
+        if self.playlist_dialog.isVisible():
+            self.playlist_dialog.hide()
+        else:
+            self.playlist_dialog.show()
 
     def handle_media_status_change(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
             self.play_next()
+        elif status == QMediaPlayer.MediaStatus.InvalidMedia:
+            if not getattr(self, '_invalid_warned', False):
+                self._invalid_warned = True
+                name = os.path.basename(self.current_file_path) if self.current_file_path else ""
+                QMessageBox.warning(
+                    self, "无法播放",
+                    f"该格式暂不支持播放（缺少相应解码器）：\n{name}"
+                )
 
     def update_play_button_icon(self, state):
         if state == QMediaPlayer.PlaybackState.StoppedState:

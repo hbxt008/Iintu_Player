@@ -1,0 +1,16 @@
+# Build artifacts
+Intu_Player.build/
+Intu_Player.dist/
+build/
+dist/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local settings
+settings.json
+
+# Release archives
+*.7z
+*.zip
