@@ -68,7 +68,7 @@ QListWidget {background-color: #3c3c3c; color: #f0f0f0; border: 1px solid #50505
 QListWidget::item:hover {background-color: #555555;}
 
 """
-CURRENT_VERSION = "v2.8.0"
+CURRENT_VERSION = "v2.8.1"
 
 # ---------------------------------------------------------------------------
 # Key → semitone map (relative to C)
@@ -365,6 +365,9 @@ class AudioPlayer(QMainWindow):
         self._previewing = False
         self._preview_saved_volume = 0.7
         self._invalid_warned = False
+        self._defer_timer = QTimer(self)
+        self._defer_timer.setSingleShot(True)
+        self._defer_timer.timeout.connect(self._on_defer_timeout)
         
         self.load_settings()
 
@@ -654,8 +657,20 @@ class AudioPlayer(QMainWindow):
         except OSError:
             self.info_label.setFullText(os.path.basename(file_path))
 
+    def _cancel_preview(self):
+        """取消尚未完成的首帧预览（不改变当前播放状态）。"""
+        if getattr(self, '_previewing', False):
+            self._previewing = False
+            try:
+                self.video_widget.videoSink().videoFrameChanged.disconnect(self._on_preview_frame)
+            except Exception:
+                pass
+            self.audio_output.setVolume(self._preview_saved_volume)
+
     def _load_media(self, file_path, preview_first_frame):
         """按媒体类型加载：视频→视频部件；音频→图片逻辑。不自动播放。"""
+        self._cancel_preview()
+        self._defer_timer.stop()
         self.current_file_path = file_path
         self._invalid_warned = False
         self.update_info_label(file_path)
@@ -702,11 +717,31 @@ class AudioPlayer(QMainWindow):
         self.player.setPosition(0)
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
 
-    def play_file(self, file_path):
+    def _defer_play(self, file_path, delay_ms):
+        """显示下一视频的首帧，延时 delay_ms 后再开始播放。"""
+        self._defer_timer.stop()
         self.player.stop()
         self._load_media(file_path, preview_first_frame=True)
-        # 视频仅做首帧预览；音频需用户点击播放按钮才会播放
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
+        self._defer_timer.start(delay_ms)
+
+    def _on_defer_timeout(self):
+        if self.current_file_path and self._is_video(self.current_file_path):
+            self._cancel_preview()
+            self.player.setPosition(0)
+            self.player.play()
+            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+
+    def play_file(self, file_path, auto_play=False):
+        self.player.stop()
+        # auto_play（连播/上一首/下一首/双击）时跳过首帧预览，直接播放；
+        # 仅用户主动选中文件时才做首帧预览（不自动播放）。
+        self._load_media(file_path, preview_first_frame=not auto_play)
+        if auto_play:
+            self.player.play()
+            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        else:
+            self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.save_settings()
 
     def playlist_file_double_clicked(self, file_path):
@@ -714,11 +749,8 @@ class AudioPlayer(QMainWindow):
             index = self.playlist.index(file_path)
             if 0 <= index < len(self.playlist):
                 self.current_index = index
-                self.play_file(self.playlist[index])
+                self.play_file(self.playlist[index], auto_play=True)
                 self.playlist_dialog.playlist_widget.setCurrentRow(self.current_index)
-                # 双击列表项时自动播放
-                self.player.play()
-                self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
         except ValueError:
             pass
 
@@ -727,12 +759,14 @@ class AudioPlayer(QMainWindow):
             self.player.pause()
             self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         else:
+            self._defer_timer.stop()
             if self.player.source().isEmpty() and self.current_file_path:
                 self._load_media(self.current_file_path, preview_first_frame=False)
             self.player.play()
             self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
     def stop(self):
+        self._defer_timer.stop()
         self.player.stop()
         self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay))
         self.image_timeline = []
@@ -742,18 +776,19 @@ class AudioPlayer(QMainWindow):
     def play_previous(self):
         if not self.playlist: return
         self.current_index = (self.current_index - 1) % len(self.playlist)
-        self.play_file(self.playlist[self.current_index])
+        self.play_file(self.playlist[self.current_index], auto_play=True)
         self.playlist_dialog.playlist_widget.setCurrentRow(self.current_index)
-        self.player.play()
-        self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
 
-    def play_next(self):
+    def play_next(self, from_end=False):
         if not self.playlist: return
         self.current_index = (self.current_index + 1) % len(self.playlist)
-        self.play_file(self.playlist[self.current_index])
+        next_path = self.playlist[self.current_index]
         self.playlist_dialog.playlist_widget.setCurrentRow(self.current_index)
-        self.player.play()
-        self.play_button.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPause))
+        if from_end and self._is_video(next_path):
+            # 视频播放结束后：先显示下一视频首帧，5 秒后再开始播放
+            self._defer_play(next_path, delay_ms=5000)
+        else:
+            self.play_file(next_path, auto_play=True)
 
     def show_playlist(self):
         if self.playlist_dialog.isVisible():
@@ -763,7 +798,7 @@ class AudioPlayer(QMainWindow):
 
     def handle_media_status_change(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia:
-            self.play_next()
+            self.play_next(from_end=True)
         elif status == QMediaPlayer.MediaStatus.InvalidMedia:
             if not getattr(self, '_invalid_warned', False):
                 self._invalid_warned = True
